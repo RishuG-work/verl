@@ -13,8 +13,8 @@ shift 2
 
 torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
      -m verl.trainer.fsdp_sft_trainer \
-    data.train_batch_size=8 \
-    data.micro_batch_size_per_gpu=1 \
+    data.train_batch_size=32 \
+    data.micro_batch_size_per_gpu=4 \
     data.train_files=$HOME/data/geo3k/train_clean.parquet \
     data.val_files=$HOME/data/geo3k/test_clean.parquet \
     data.prompt_key=prompt \

@@ -368,7 +368,7 @@ class FSDPSFTTrainer:
                 }
 
                 if len(multi_modal_inputs) > 0 and hasattr(multi_modal_inputs, 'data'):
-                    batch_size = input_ids.shape[0]
+                    
                     
                     # Collect all pixel_values and image_grid_thw from the 32 items
                     pixel_values_list = []
@@ -382,21 +382,41 @@ class FSDPSFTTrainer:
                                 image_grid_thw_list.append(item['image_grid_thw'])
                     
                     if pixel_values_list:
-                        if batch_size == 1:
+                        if len(pixel_values_list) == 1:
                             model_kwargs['pixel_values'] = pixel_values_list[0].unsqueeze(0).cuda()
                         else:
+                            concatenated_pixel_values = torch.cat(pixel_values_list, dim=0)
+                            model_kwargs['pixel_values'] = concatenated_pixel_values.unsqueeze(0).cuda()
                             # Concatenate all pixel values and reshape for batch
-                            all_pixel_values = torch.cat(pixel_values_list, dim=0)  # [total_patches, 1176]
-                            patches_per_sample = all_pixel_values.shape[0] // batch_size
-                            batched_pixel_values = all_pixel_values.view(batch_size, patches_per_sample, -1)
-                            model_kwargs['pixel_values'] = batched_pixel_values.cuda()
-                    
+                            #all_pixel_values = torch.cat(pixel_values_list, dim=0)  # [total_patches, 1176]
+                            #patches_per_sample = all_pixel_values.shape[0] // batch_size
+                            #batched_pixel_values = all_pixel_values.view(batch_size, patches_per_sample, -1)
+                            #model_kwargs['pixel_values'] = batched_pixel_values.cuda()
+                            #max_patches = max(pv.shape[0] for pv in pixel_values_list)
+                            #feature_dim = pixel_values_list[0].shape[-1]
+                            
+                            #batched_pixel_values = torch.zeros(
+                            #    len(pixel_values_list), max_patches, feature_dim,
+                            #    dtype=pixel_values_list[0].dtype,
+                            #    device=pixel_values_list[0].device
+                            #)
+                            
+                            #for i, pv in enumerate(pixel_values_list):
+                            #    batched_pixel_values[i, :pv.shape[0]] = pv
+                            
+                            #model_kwargs['pixel_values'] = batched_pixel_values.cuda()
+
                     if image_grid_thw_list:
-                        if batch_size == 1:
+                        if len(image_grid_thw_list) == 1:
                             model_kwargs['image_grid_thw'] = image_grid_thw_list[0].cuda()
                         else:
-                            all_image_grid_thw = torch.cat(image_grid_thw_list, dim=0)
-                            model_kwargs['image_grid_thw'] = all_image_grid_thw.cuda()
+                            # For Qwen2.5-VL, image_grid_thw should be concatenated, not stacked
+                            # Each tensor in the list represents grid info for one sample
+                            concatenated_image_grid_thw = torch.cat(image_grid_thw_list, dim=0)
+                            model_kwargs['image_grid_thw'] = concatenated_image_grid_thw.cuda()
+                            #all_image_grid_thw = torch.cat(image_grid_thw_list, dim=0)
+                            #stacked_image_grid_thw = torch.stack(image_grid_thw_list, dim=0)
+                            #model_kwargs['image_grid_thw'] = stacked_image_grid_thw.cuda()
                     
                 output = self.fsdp_model(**model_kwargs) 
                 #output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
@@ -424,7 +444,12 @@ class FSDPSFTTrainer:
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
                 # Unpad position_ids to align rotary
-                position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
+                if position_ids.dim() == 3:
+                    print("position_ids is 3d")
+                    position_ids_rmpad = index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices).transpose(0, 1).unsqueeze(1)  # (3, bsz, seqlen) -> (3, 1, bsz * seqlen)
+                else:
+                    position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
+                #position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
 
                 # Pad and slice inputs for sequence parallelism
                 input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size())
@@ -514,7 +539,7 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
 
-        micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
+        micro_batches = self._split_batch_with_indices(batch, self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
         for micro_batch in micro_batches:
@@ -544,6 +569,37 @@ class FSDPSFTTrainer:
         step_loss = torch.tensor(step_loss).cuda()
         torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
         return {"train/loss": step_loss.detach().item(), "train/lr(1e-3)": lr * 1e3}
+
+    def _split_batch_with_indices(self, batch: TensorDict, micro_batch_size: int):
+        """Split batch into micro-batches while preserving original indices for multimodal inputs"""
+        batch_size = batch.batch_size[0]
+        micro_batches = []
+        
+        for start_idx in range(0, batch_size, micro_batch_size):
+            end_idx = min(start_idx + micro_batch_size, batch_size)
+            indices = list(range(start_idx, end_idx))
+            
+            # Create micro-batch by slicing
+            micro_batch = {}
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    micro_batch[key] = value[start_idx:end_idx]
+                else:
+                    # Handle non-tensor data (like multi_modal_inputs)
+                    if hasattr(value, 'data') and isinstance(value.data, list):
+                        # For multimodal inputs, slice the data list
+                        sliced_data = value.data[start_idx:end_idx]
+                        micro_batch[key] = type(value)(data=sliced_data)
+                    else:
+                        micro_batch[key] = value[start_idx:end_idx] if hasattr(value, '__getitem__') else value
+            
+            # Create TensorDict for the micro-batch
+            micro_batch_td = TensorDict(micro_batch, batch_size=(end_idx - start_idx,))
+            # Store the original indices for reference
+            micro_batch_td._original_indices = indices
+            micro_batches.append(micro_batch_td)
+        
+        return micro_batches
 
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
@@ -614,7 +670,9 @@ class FSDPSFTTrainer:
                     # Perform final validation
                     val_losses = []
                     for val_data in self.val_dataloader:
-                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+                        actual_batch_size = len(val_data['input_ids']) if 'input_ids' in val_data else len(next(iter(val_data.values())))
+                        val_data = TensorDict(val_data, batch_size=actual_batch_size).cuda()
+                        #val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
                         val_loss = self.validation_step(val_data)
                         val_losses.append(val_loss)
                     if rank == 0:
@@ -630,7 +688,9 @@ class FSDPSFTTrainer:
             # validation
             val_losses = []
             for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+                actual_batch_size = len(data['input_ids']) if 'input_ids' in data else len(next(iter(data.values())))
+                data = TensorDict(data, batch_size=actual_batch_size).cuda()
+                #data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
                 val_loss = self.validation_step(data)
                 val_losses.append(val_loss)
             if rank == 0:
